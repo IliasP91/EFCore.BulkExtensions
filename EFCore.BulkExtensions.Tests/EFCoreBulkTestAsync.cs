@@ -1,13 +1,13 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading.Tasks;
 using EFCore.BulkExtensions.SqlAdapters;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage;
-using Microsoft.Extensions.Caching.Memory;
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Linq;
-using System.Threading.Tasks;
 using Xunit;
 
 namespace EFCore.BulkExtensions.Tests;
@@ -275,7 +275,7 @@ public class EFCoreBulkTestAsync
             await context.BulkInsertOrUpdateOrDeleteAsync(entities, bulkConfig);
             Assert.Equal(0, bulkConfig.StatsInfo?.StatsNumberInserted);
             Assert.Equal(EntitiesNumber / 2, bulkConfig.StatsInfo?.StatsNumberUpdated);
-            Assert.Equal((EntitiesNumber / 2) -1, bulkConfig.StatsInfo?.StatsNumberDeleted);
+            Assert.Equal((EntitiesNumber / 2) - 1, bulkConfig.StatsInfo?.StatsNumberDeleted);
         }
         else
         {
@@ -362,7 +362,7 @@ public class EFCoreBulkTestAsync
             entities.Add(new Item { Name = "name " + i });
         }
 
-        var bulkConfig = new BulkConfig { UpdateByProperties = new List<string> { nameof(Item.Name) }};
+        var bulkConfig = new BulkConfig { UpdateByProperties = new List<string> { nameof(Item.Name) } };
         await context.BulkReadAsync(entities, bulkConfig).ConfigureAwait(false);
 
         Assert.Equal(1, entities[0].ItemId);
@@ -410,4 +410,220 @@ public class EFCoreBulkTestAsync
         };
         await context.Database.ExecuteSqlRawAsync(deleteTableSql).ConfigureAwait(false);
     }
+
+
+    [Theory]
+    [InlineData(DbServer.SQLServer, true)]
+    [InlineData(DbServer.SQLServer, false)]
+    public async Task TrackingEntitiesTestAsync(DbServer dbServer, bool useTransaction)
+    {
+        ContextUtil.DbServer = dbServer;
+        await new EFCoreBatchTestAsync().RunDeleteAllAsync(dbServer);
+
+        // Test can be run individually by commenting others and running each separately in order one after another
+        await BulkInsertAsync(useTransaction);
+
+        await new EFCoreBatchTestAsync().RunDeleteAllAsync(dbServer);
+
+        await BulkInsertOrUpdateAsync(useTransaction);
+
+        await BulkReadAsync(useTransaction);
+    }
+
+    private static async Task BulkInsertAsync(bool useTransaction)
+    {
+        await using var context = new TestContext(ContextUtil.GetOptions());
+
+        IDbContextTransaction? trans = null;
+        if (useTransaction)
+        {
+            trans = await context.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+        }
+
+        var entities = new List<Item>();
+
+        for (var i = 1; i < EntitiesNumber; i++)
+        {
+            var entity = new Item
+            {
+                //ItemId = isBulk ? i : 0, Don't pre-populate the PK, let SQL server generate it
+                Name = "name " + i,
+                Description = string.Concat("info ", Guid.NewGuid().ToString().AsSpan(0, 3)),
+                Quantity = i % 10,
+                Price = i / (i % 5 + 1),
+                TimeUpdated = DateTime.Now,
+                ItemHistories = new List<ItemHistory>()
+            };
+
+            entities.Add(entity);
+        }
+
+        var bulkConfig = new BulkConfig
+        {
+            CalculateStats = true,
+
+            SetOutputIdentity = true,
+            WithHoldlock = false,
+            TrackingEntities = true
+        };
+
+        await context.BulkInsertAsync(entities, bulkConfig, (a) => WriteProgress(a));
+
+        Assert.Equal(EntitiesNumber - 1, bulkConfig.StatsInfo?.StatsNumberInserted);
+        Assert.Equal(0, bulkConfig.StatsInfo?.StatsNumberUpdated);
+        Assert.Equal(0, bulkConfig.StatsInfo?.StatsNumberDeleted);
+
+        foreach (var entity in entities)
+        {
+            // Check that SetOutputIdentity works
+            Assert.True(entity.ItemId > 0, "The ItemId was not returned by the bulk insert");
+
+            // Set the price for every Item entity to 1.0 and then SaveChanges to test if the inserted entities are Tracked in EF
+            entity.Price = 1.0m;
+        }
+
+        await context.SaveChangesAsync();
+
+        // Tried with this also, doesn't work
+        //await context.BulkSaveChangesAsync();
+
+        // Read entities from the db
+        var savedEntities = await context.Items.ToArrayAsync();
+
+        foreach (var entity in savedEntities)
+        {
+            Assert.Equal(1.0m, entity.Price);
+        }
+
+        if (useTransaction)
+        {
+            await trans!.CommitAsync();
+        }
+    }
+
+    private static async Task BulkInsertOrUpdateAsync(bool useTransaction)
+    {
+        await using var context = new TestContext(ContextUtil.GetOptions());
+
+        IDbContextTransaction? trans = null;
+        if (useTransaction)
+        {
+            trans = await context.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+        }
+
+        var entities = new List<Item>();
+
+        for (var i = 1; i < EntitiesNumber; i++)
+        {
+            var entity = new Item
+            {
+                //ItemId = isBulk ? i : 0, Don't pre-populate the PK, let SQL server generate it
+                Name = "name " + i,
+                Description = string.Concat("info ", Guid.NewGuid().ToString().AsSpan(0, 3)),
+                Quantity = i % 10,
+                Price = i / (i % 5 + 1),
+                TimeUpdated = DateTime.Now,
+                ItemHistories = new List<ItemHistory>()
+            };
+
+            entities.Add(entity);
+        }
+
+        var bulkConfig = new BulkConfig
+        {
+            UpdateByProperties = new List<string>
+            {
+                nameof(Item.Name) // Update by another property
+            },
+            PropertiesToIncludeOnUpdate = new List<string> { "" }, // Insert only what is missing, don't update existing entities
+            CalculateStats = true,
+
+            SetOutputIdentity = true,
+            WithHoldlock = false,
+            TrackingEntities = true
+        };
+
+        await context.BulkInsertOrUpdateAsync(entities, bulkConfig, (a) => WriteProgress(a));
+
+        Assert.Equal(EntitiesNumber - 1, bulkConfig.StatsInfo?.StatsNumberInserted);
+        Assert.Equal(0, bulkConfig.StatsInfo?.StatsNumberUpdated);
+        Assert.Equal(0, bulkConfig.StatsInfo?.StatsNumberDeleted);
+
+        foreach (var entity in entities)
+        {
+            // Check that SetOutputIdentity works
+            Assert.True(entity.ItemId > 0, "The ItemId was not returned by the bulk insert");
+
+            // Set the price for every Item entity to 1.0 and then SaveChanges to test if the inserted entities are Tracked in EF
+            entity.Price = 1.0m;
+        }
+
+        await context.SaveChangesAsync();
+
+        // Tried with this also, doesn't work
+        //await context.BulkSaveChangesAsync();
+
+        // Read entities from the db
+        var savedEntities = await context.Items.ToArrayAsync();
+
+        foreach (var entity in savedEntities)
+        {
+            Assert.Equal(1.0m, entity.Price);
+        }
+
+        if (useTransaction)
+        {
+            await trans!.CommitAsync();
+        }
+    }
+
+    private static async Task BulkReadAsync(bool useTransaction)
+    {
+        await using var context = new TestContext(ContextUtil.GetOptions());
+
+        IDbContextTransaction? trans = null;
+        if (useTransaction)
+        {
+            trans = await context.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+        }
+
+        var entities = new List<Item>();
+        for (int i = 1; i < EntitiesNumber; i++)
+        {
+            entities.Add(new Item { Name = "name " + i });
+        }
+
+        var bulkConfig = new BulkConfig
+        {
+            UpdateByProperties = new List<string> { nameof(Item.Name) },
+            TrackingEntities = true
+        };
+
+        await context.BulkReadAsync(entities, bulkConfig).ConfigureAwait(false);
+
+        foreach (var entity in entities)
+        {
+            Assert.True(entity.ItemId > 0, "The ItemId was not returned by the bulk insert");
+            entity.Price = 1.0m;
+        }
+
+        await context.SaveChangesAsync();
+
+        // Tried with this also, doesn't work
+        //await context.BulkSaveChangesAsync();
+
+        // Read entities from the db
+        var savedEntities = await context.Items.ToArrayAsync();
+
+        foreach (var entity in savedEntities)
+        {
+            Assert.Equal(1.0m, entity.Price);
+        }
+
+        if (useTransaction)
+        {
+            await trans!.CommitAsync();
+        }
+    }
+
 }
